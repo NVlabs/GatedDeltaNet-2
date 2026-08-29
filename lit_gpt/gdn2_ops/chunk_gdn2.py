@@ -80,13 +80,9 @@ NUM_WARPS_WY = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 NUM_WARPS_INTRA = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 NUM_WARPS_GENERIC = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 
-from .chunk_kda import (
-    chunk_gated_delta_rule_fwd_h,    
-    chunk_gated_delta_rule_bwd_dhu,  
-    chunk_kda_bwd_dAv,               
-    kda_gate_chunk_cumsum,           
-    kda_gate_bwd,                    
-)
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from fla.ops.kda.chunk_bwd import chunk_kda_bwd_dAv
+from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
 
 # =============================================================================
 # FORWARD KERNELS
