@@ -8,6 +8,10 @@ Official PyTorch implementation of [**Gated DeltaNet-2: Decoupling Erase and Wri
 [Yejin Choi](https://homes.cs.washington.edu/~yejin/), and
 [Jan Kautz](https://jankautz.com/).
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/1e33454d-69c1-49be-8f0b-0902878dfd98" alt="GDN-2 — Gated DeltaNet-2" width="100%">
+</p>
+
 
 ## 🌟 Why Gated DeltaNet-2?
 
