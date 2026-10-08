@@ -12,6 +12,10 @@ Official PyTorch implementation of [**Gated DeltaNet-2: Decoupling Erase and Wri
   <img src="https://github.com/user-attachments/assets/1e33454d-69c1-49be-8f0b-0902878dfd98" alt="GDN-2 — Gated DeltaNet-2" width="100%">
 </p>
 
+## 📢 Latest Updates
+- `09/24/2026`: 🔥🔥  **Gated DeltaNet-2** has been accepted to **NeurIPS 2026** ! 🎉 🎊🥂 
+- `05/21/2026`: 🔥 **Code Release**: Train your own Gated DeltaNet-2 on FineWeb-Edu
+- Watch this space for more exciting updates!
 
 ## 🌟 Why Gated DeltaNet-2?
 
@@ -107,12 +111,6 @@ Gated DeltaNet-2 retains near-flat scaling with sequence length on a single H100
 | **Gated DeltaNet-2** | **channel-wise** | **channel-wise `b_t`** | **channel-wise `w_t`** |
 
 Ablations confirm both gates contribute, with the **erase gate `b_t` accounting for most of the gain** — consistent with its role in selectively protecting or revising key-side associations in the recurrent state.
-
-
-## 📢 Latest Updates
-
-- `05/21/2026`: 🔥 **Code Release**: Train your own Gated DeltaNet-2 on FineWeb-Edu
-- Watch this space for more exciting updates!
 
 
 ## 🚀 Getting Started
