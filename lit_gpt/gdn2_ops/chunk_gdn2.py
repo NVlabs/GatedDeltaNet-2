@@ -29,6 +29,9 @@ keeps complexity linear in sequence length and maps onto tensor cores.
 Pipeline
 --------
 Forward (see ``chunk_gdn2_fwd``):
+  0. ``_gdn2_beta_guard_fwd_kernel``                 - conditional beta-contrast
+     guard (``beta_guard``, on by default): projects the erase gate b onto
+     the certified non-expansive set; the result replaces b in steps 1-4.
   1. ``chunk_gdn2_fwd_kernel_intra_token_parallel``  - intra-chunk Q-K and
      gated K-K score matrices (Aqk, Akk).
   2. ``chunk_gdn2_fwd_kernel_intra_sub_chunk``       - sub-chunk refinement
@@ -48,6 +51,8 @@ Backward (see ``chunk_gdn2_bwd``):
   - ``chunk_gdn2_bwd_kernel_intra``         - intra-chunk gradients for Q, K,
     the erase gate, and the cumulative decay.
   The dAv and dhu backward kernels are shared with KDA.
+  The beta guard is re-applied first to recover the forward's effective erase
+  gate; it adds no autograd subgraph, so db flows straight-through to b.
 
 Public entry point: ``chunk_gdn2``. Autograd wrapper: ``ChunkGDN2Function``.
 All other names are internal orchestration or Triton kernels.
@@ -55,6 +60,7 @@ All other names are internal orchestration or Triton kernels.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -80,9 +86,236 @@ NUM_WARPS_WY = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 NUM_WARPS_INTRA = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 NUM_WARPS_GENERIC = [1, 2, 4] if IS_NVIDIA_HOPPER else [1, 2, 4, 8]
 
+# Beta-guard projection margin and re-test tolerance (in out-dtype eps units).
+GUARD_MARGIN = 1.0 / 32
+GUARD_QUANT_TOL_MULT = 4.0
+
+
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd_dAv
 from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
+
+
+# =============================================================================
+# BETA-CONTRAST GUARD
+# -----------------------------------------------------------------------------
+# _gdn2_beta_guard_fwd_kernel / _GDN2BetaGuard
+#
+# Conditional sensor/actuator on the erase gate b (``beta_guard``, on by
+# default). Per (token, head) row, from the L2-normalized key k, the gate b and
+# the per-token decay g recovered from the chunk-local cumsum, it tests whether
+# the erase step (I - k (b*k)^T) Diag(exp(g)) is certified non-expansive.
+# Safe rows pass through unchanged. Unsafe rows keep their key-weighted mean
+# erase strength and only have the channel contrast of b shrunk onto the
+# boundary (less GUARD_MARGIN); the candidate is re-tested after quantization
+# to b's dtype, with a scalar-mean fallback if rounding crosses the boundary.
+# Decay and write gate are never modified.
+#
+# The projected gate replaces b in every downstream kernel, forward and
+# backward. It runs outside autograd, so the gradient w.r.t. b is
+# straight-through.
+# =============================================================================
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["N_ROWS", "T", "N"])
+def _gdn2_beta_guard_fwd_kernel(
+    k,
+    b,
+    g_cumsum,
+    b_out,
+    cu_seqlens,
+    N_ROWS,
+    N,
+    T,
+    quant_eps,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    BR: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    LN2: tl.constexpr,
+    MARGIN: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_block = tl.program_id(0)
+
+    o_r = i_block * BR + tl.arange(0, BR)
+    o_k = tl.arange(0, BK)
+
+    m_r = o_r < N_ROWS
+    m_k = o_k < K
+    mask = m_r[:, None] & m_k[None, :]
+
+    # Flattened row order is [B, T, H].
+    i_bt = o_r // H
+
+    if IS_VARLEN:
+        # Packed inputs have B == 1 and i_bt is the global packed token index.
+        i_token = i_bt.to(tl.int32)
+        left = tl.zeros([BR], dtype=tl.int32)
+        right = tl.full([BR], N, dtype=tl.int32)
+
+        for _ in range(20):
+            active = m_r & (left < right)
+            mid = (left + right) // 2
+            next_boundary = tl.load(
+                cu_seqlens + mid + 1,
+                mask=active,
+                other=0,
+            ).to(tl.int32)
+            go_left = i_token < next_boundary
+            right = tl.where(active & go_left, mid, right)
+            left = tl.where(active & ~go_left, mid + 1, left)
+
+        bos = tl.load(cu_seqlens + left, mask=m_r, other=0).to(tl.int32)
+        local_t = i_token - bos
+    else:
+        local_t = (i_bt % T).to(tl.int32)
+
+    is_chunk_start = (local_t % CHUNK_SIZE) == 0
+
+    offsets = o_r.to(tl.int64)[:, None] * K + o_k[None, :]
+
+    b_k = tl.load(k + offsets, mask=mask, other=0.0).to(tl.float32)
+    b_b = tl.load(b + offsets, mask=mask, other=0.0).to(tl.float32)
+    b_gc = tl.load(
+        g_cumsum + offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    # Recover the per-token gate from chunk-local cumulative log2 values.
+    prev_offsets = offsets - H * K
+    prev_mask = mask & (~is_chunk_start[:, None])
+    b_gc_prev = tl.load(
+        g_cumsum + prev_offsets,
+        mask=prev_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    b_g = (b_gc - b_gc_prev) * LN2
+    b_g = tl.where(mask, b_g, -float("inf"))
+    g_max = tl.max(b_g, axis=1)
+
+    # Key-weighted moments: n = |k|^2, a = sum(b k^2), nu = sum(b^2 k^2);
+    # r2 = n*nu - a^2 >= 0 is the contrast of b along the key.
+    b_k2 = b_k * b_k
+    n = tl.sum(b_k2, axis=1)
+    a = tl.sum(b_b * b_k2, axis=1)
+    nu = tl.sum(b_b * b_b * b_k2, axis=1)
+
+    r2 = tl.maximum(n * nu - a * a, 0.0)
+
+    # c^2 = exp(-2*g_max). The attached mixer guarantees g_max <= 0.
+    c2 = tl.exp(-2.0 * g_max)
+    r2_crit = (c2 - 1.0) * (
+        1.0 - ((1.0 - a) * (1.0 - a)) / c2
+    )
+    r2_crit = tl.maximum(r2_crit, 0.0)
+
+    has_key = n > 1.0e-20
+    unsafe = m_r & has_key & (r2 > r2_crit)
+
+    # Shrink only the contrast about the key-weighted mean mu.
+    mu = a / tl.maximum(n, 1.0e-20)
+    eta = tl.sqrt((1.0 - MARGIN) * r2_crit / tl.maximum(r2, 1.0e-30))
+    eta = tl.minimum(tl.maximum(eta, 0.0), 1.0)
+
+    projected = mu[:, None] + eta[:, None] * (b_b - mu[:, None])
+    candidate = tl.where(unsafe[:, None], projected, b_b)
+
+    candidate_q = candidate.to(b_out.dtype.element_ty).to(tl.float32)
+    a_q = tl.sum(candidate_q * b_k2, axis=1)
+    nu_q = tl.sum(candidate_q * candidate_q * b_k2, axis=1)
+    r2_q = tl.maximum(n * nu_q - a_q * a_q, 0.0)
+    r2_crit_q = (c2 - 1.0) * (
+        1.0 - ((1.0 - a_q) * (1.0 - a_q)) / c2
+    )
+    r2_crit_q = tl.maximum(r2_crit_q, 0.0)
+
+    # Exact projection lands ON the boundary; tolerate out-dtype rounding
+    # noise on the r2 = n*nu - a^2 cancellation.
+    quant_tol = quant_eps * (n * nu_q + a_q * a_q)
+    needs_scalar_fallback = unsafe & (r2_q > r2_crit_q + quant_tol)
+    mu_q = a_q / tl.maximum(n, 1.0e-20)
+    final_b = tl.where(
+        needs_scalar_fallback[:, None],
+        mu_q[:, None],
+        candidate_q,
+    )
+
+    
+    tl.store(
+        b_out + offsets,
+        final_b.to(b_out.dtype.element_ty),
+        mask=mask,
+    )
+
+
+class _GDN2BetaGuard:
+    """Launch the beta sensor/actuator without adding an autograd subgraph."""
+
+    @staticmethod
+    def project(
+        k: torch.Tensor,
+        b: torch.Tensor,
+        g_cumsum: torch.Tensor,
+        *,
+        chunk_size: int,
+        cu_seqlens: torch.LongTensor | None,
+    ) -> torch.Tensor:
+        if not (k.is_cuda and b.is_cuda and g_cumsum.is_cuda):
+            raise ValueError("_GDN2BetaGuard requires CUDA tensors.")
+        if k.shape != b.shape or k.shape != g_cumsum.shape:
+            raise ValueError(
+                "_GDN2BetaGuard requires k, b, and g_cumsum to have the same "
+                f"[B,T,H,K] shape; got k={tuple(k.shape)}, "
+                f"b={tuple(b.shape)}, g={tuple(g_cumsum.shape)}."
+            )
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+
+        B, T, H, K = k.shape
+        if K < 2 or K > 256:
+            raise ValueError(
+                f"_GDN2BetaGuard supports 2 <= K <= 256, got K={K}."
+            )
+
+        k_c = k.contiguous()
+        b_c = b.contiguous()
+        g_c = g_cumsum.contiguous()
+        b_out = torch.empty_like(b_c, memory_format=torch.contiguous_format)
+
+        n_rows = B * T * H
+        n_sequences = B if cu_seqlens is None else len(cu_seqlens) - 1
+        BK = triton.next_power_of_2(K)
+        BR = min(8, max(1, 512 // BK))
+
+        _gdn2_beta_guard_fwd_kernel[(triton.cdiv(n_rows, BR),)](
+            k=k_c,
+            b=b_c,
+            g_cumsum=g_c,
+            b_out=b_out,
+            cu_seqlens=cu_seqlens,
+            N_ROWS=n_rows,
+            N=n_sequences,
+            T=T,
+            quant_eps=GUARD_QUANT_TOL_MULT * torch.finfo(b_c.dtype).eps,
+            H=H,
+            K=K,
+            BK=BK,
+            BR=BR,
+            CHUNK_SIZE=chunk_size,
+            LN2=math.log(2.0),
+            MARGIN=GUARD_MARGIN,
+            num_warps=4,
+            num_stages=1,
+        )
+        return b_out
+
 
 # =============================================================================
 # FORWARD KERNELS
@@ -971,7 +1204,7 @@ def chunk_gdn2_fwd(
     dt_bias: torch.Tensor | None = None,
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
-    transpose_state_layout: bool = False,
+    beta_guard: bool = False,
 ):
     """Top-level GDN-2 forward pipeline.
 
@@ -999,12 +1232,25 @@ def chunk_gdn2_fwd(
             chunk_indices=chunk_indices,
         )
 
+    # Beta guard: certified-safe erase gate used by every kernel below.
+    b_effective = (
+        _GDN2BetaGuard.project(
+            k=k,
+            b=b,
+            g_cumsum=g,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+        )
+        if beta_guard
+        else b
+    )
+
     w, u, qg, kg, Aqk, Akk = chunk_gdn2_fwd_intra(
         q=q,
         k=k,
         v=v,
         gk=g,
-        b=b,
+        b=b_effective,
         wg=wg,
         scale=scale,
         cu_seqlens=cu_seqlens,
@@ -1024,8 +1270,6 @@ def chunk_gdn2_fwd(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
     )
 
     o = chunk_gla_fwd_o_gk(
@@ -1038,8 +1282,6 @@ def chunk_gdn2_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
     )
 
     if disable_recompute is False:
@@ -1071,7 +1313,7 @@ def chunk_gdn2(
     lower_bound: float | None = None,
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
-    transpose_state_layout: bool = False,
+    beta_guard: bool = True,
     **kwargs,
 ):
     r"""
@@ -1124,8 +1366,13 @@ def chunk_gdn2(
         return_intermediate_states (bool):
             If True, also return the per-chunk pre-states `h` (shape
             [B, NT, H, K, V]). Must be used within `torch.inference_mode()`.
-        transpose_state_layout (bool):
-            Use the transposed state layout in the recurrence kernel.
+        beta_guard (bool):
+            Enable the conditional key-weighted beta-contrast sensor/actuator.
+            Defaults to True. Safe token/head rows are copied unchanged; only
+            rows that violate the analytical non-expansion condition have their
+            beta contrast reduced. Decay and write gates are never modified.
+            Backward uses a straight-through gradient for the original beta.
+
 
     Returns:
         Normal:  (o, final_state)
@@ -1176,9 +1423,14 @@ def chunk_gdn2(
         "v must be of shape (batch size, seq len, num of head, head dim)."
     )
 
+    if beta_guard and not use_qk_l2norm_in_kernel:
+        raise ValueError(
+            "`beta_guard=True` requires `use_qk_l2norm_in_kernel=True` so the "
+            "sensor sees the exact normalized key used by the recurrence."
+        )
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
-
 
     return ChunkGDN2Function.apply(
         q,
@@ -1200,7 +1452,7 @@ def chunk_gdn2(
         lower_bound,
         disable_recompute,
         return_intermediate_states,
-        transpose_state_layout,
+        beta_guard,
     )
 
 
@@ -1237,7 +1489,7 @@ def chunk_gdn2(
         for num_stages in [2, 3, 4]
         if not (IS_NVIDIA_HOPPER and BK == 32 and num_warps == 4)
     ],
-    key=['BT', 'TRANSPOSE_STATE'],
+    key=['BT'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -1271,7 +1523,6 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    TRANSPOSE_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -1339,12 +1590,8 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
         for i_v in range(tl.cdiv(V, BV)):
             p_v_new = tl.make_block_ptr(v_new, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            if TRANSPOSE_STATE:
-                p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-                p_dh = tl.make_block_ptr(dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-            else:
-                p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-                p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+            p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+            p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
             p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             # [BT, BV]
             b_v_new = tl.load(p_v_new, boundary_check=(0, 1))
@@ -1724,7 +1971,6 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
-    transpose_state_layout: bool = False,
 ):
     """Fused backward for WY auxiliaries + dq/dk/dg/db/dw.
 
@@ -1777,7 +2023,6 @@ def chunk_gdn2_bwd_wy_dqkg_fused(
         K=K,
         V=V,
         BT=BT,
-        TRANSPOSE_STATE=transpose_state_layout,
     )
     dv = dv2
     return dq, dk, dv, db, dw, dg, dA
@@ -1874,7 +2119,6 @@ def chunk_gdn2_bwd(
     use_gate_in_kernel: bool = False,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
-    transpose_state_layout: bool = False,
     w_wy: torch.Tensor | None = None,
     u_wy: torch.Tensor | None = None,
     qg: torch.Tensor | None = None,
@@ -1882,6 +2126,7 @@ def chunk_gdn2_bwd(
     v_new: torch.Tensor | None = None,
     h: torch.Tensor | None = None,
     disable_recompute: bool = False,
+    beta_guard: bool = False,
 ):
     """End-to-end GDN-2 backward.
 
@@ -1889,22 +2134,37 @@ def chunk_gdn2_bwd(
         dq, dk, dv, db, dw, dg, dh0, dA_log, dt_bias_grad
         where db is [B,T,H,K] and dw is [B,T,H,V] (the new GDN-2 gradients).
     """
+    if not disable_recompute and use_gate_in_kernel:
+        g = kda_gate_chunk_cumsum(
+            g=g_org,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=RCP_LN2,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            lower_bound=lower_bound,
+        )
+
+    # Recompute the forward's effective erase gate; the guard has no
+    # autograd subgraph, so db flows straight-through to b.
+    b_effective = (
+        _GDN2BetaGuard.project(
+            k=k,
+            b=b,
+            g_cumsum=g,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+        )
+        if beta_guard
+        else b
+    )
+
     if not disable_recompute:
-        if use_gate_in_kernel:
-            g = kda_gate_chunk_cumsum(
-                g=g_org,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=RCP_LN2,
-                chunk_size=chunk_size,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                lower_bound=lower_bound,
-            )
         w_wy, u_wy, qg, kg = recompute_w_u_fwd_gdn2(
             k=k,
             v=v,
-            b=b,
+            b=b_effective,
             wg=wg,
             A=Akk,
             q=q,
@@ -1921,8 +2181,6 @@ def chunk_gdn2_bwd(
             output_final_state=False,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
-            use_exp2=True,
-            transpose_state_layout=transpose_state_layout,
         )
 
     dAqk, dv = chunk_kda_bwd_dAv(
@@ -1949,8 +2207,6 @@ def chunk_gdn2_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        use_exp2=True,
-        transpose_state_layout=transpose_state_layout,
     )
 
     dq, dk, dv, db, dw, dg, dAkk = chunk_gdn2_bwd_wy_dqkg_fused(
@@ -1959,7 +2215,7 @@ def chunk_gdn2_bwd(
         v=v,
         v_new=v_new,
         g=g,
-        b=b,
+        b=b_effective,
         wg=wg,
         A=Akk,
         h=h,
@@ -1970,14 +2226,13 @@ def chunk_gdn2_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
     )
 
     dq, dk, db, dg = chunk_gdn2_bwd_intra(
         q=q,
         k=k,
         g=g,
-        b=b,
+        b=b_effective,
         dAqk=dAqk,
         dAkk=dAkk,
         dq=dq,
@@ -2050,7 +2305,7 @@ class ChunkGDN2Function(torch.autograd.Function):
         lower_bound: float | None,
         disable_recompute: bool,
         return_intermediate_states: bool,
-        transpose_state_layout: bool,
+        beta_guard: bool,
     ):
         chunk_size = 64
 
@@ -2089,7 +2344,7 @@ class ChunkGDN2Function(torch.autograd.Function):
             dt_bias=dt_bias,
             disable_recompute=disable_recompute,
             return_intermediate_states=return_intermediate_states,
-            transpose_state_layout=transpose_state_layout,
+            beta_guard=beta_guard,
         )
 
         if return_intermediate_states:
@@ -2112,8 +2367,8 @@ class ChunkGDN2Function(torch.autograd.Function):
         ctx.lower_bound = lower_bound
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.use_gate_in_kernel = use_gate_in_kernel
+        ctx.beta_guard = beta_guard
         ctx.disable_recompute = disable_recompute
-        ctx.transpose_state_layout = transpose_state_layout
         return o.type_as(q), final_state
 
     @staticmethod
@@ -2146,9 +2401,9 @@ class ChunkGDN2Function(torch.autograd.Function):
             use_gate_in_kernel=ctx.use_gate_in_kernel,
             A_log=A_log,
             dt_bias=dt_bias,
-            transpose_state_layout=ctx.transpose_state_layout,
             w_wy=w_wy, u_wy=u_wy, qg=qg, kg=kg, v_new=v_new, h=h,
             disable_recompute=ctx.disable_recompute,
+            beta_guard=ctx.beta_guard,
         )
 
         # Backprop through the optional l2norm_fwd on q, k.
@@ -2178,17 +2433,28 @@ class ChunkGDN2Function(torch.autograd.Function):
             None,                    # lower_bound
             None,                    # disable_recompute
             None,                    # return_intermediate_states
-            None,                    # transpose_state_layout
+            None,                    # beta_guard
         )
 
 
 __all__ = [
     "chunk_gdn2",
     "ChunkGDN2Function",
+    "_GDN2BetaGuard",
+    # Forward entry points
     "chunk_gdn2_fwd",
     "chunk_gdn2_fwd_intra",
     "recompute_w_u_fwd_gdn2",
+    # Backward entry points
     "chunk_gdn2_bwd",
     "chunk_gdn2_bwd_wy_dqkg_fused",
     "chunk_gdn2_bwd_intra",
+    # Triton kernels (exposed for debugging)
+    "_gdn2_beta_guard_fwd_kernel",
+    "chunk_gdn2_fwd_kernel_intra_token_parallel",
+    "chunk_gdn2_fwd_kernel_intra_sub_chunk",
+    "chunk_gdn2_fwd_kernel_inter_solve_fused",
+    "recompute_w_u_fwd_gdn2_kernel",
+    "chunk_gdn2_bwd_kernel_wy_dqkg_fused",
+    "chunk_gdn2_bwd_kernel_intra",
 ]

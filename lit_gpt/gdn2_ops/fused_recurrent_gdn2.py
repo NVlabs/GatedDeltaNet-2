@@ -33,6 +33,13 @@ paged state pool (``ssm_state_indices``), and speculative decoding
 (``num_accepted_tokens``). It can also fuse the decay-gate activation
 (``use_gate_in_kernel``) so the caller can pass raw pre-activations.
 
+The conditional beta-contrast safeguard of ``chunk_gdn2`` is fused into the
+token loop (``beta_guard``, on by default). It reads the exact normalized key
+and activated decay consumed by each update, leaves safe erase gates
+unchanged, and shrinks only unsafe channel contrast, so decode consumes the
+same effective ``b`` as the chunkwise path. Decay and write gate are never
+modified.
+
 Public entry point: ``fused_recurrent_gdn2``.
 """
 
@@ -45,6 +52,8 @@ import triton.language as tl
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
 from fla.utils import input_guard
+
+from .chunk_gdn2 import GUARD_MARGIN, GUARD_QUANT_TOL_MULT
 
 
 # =============================================================================
@@ -65,6 +74,12 @@ from fla.utils import input_guard
 # is fetched from (and written back to) a paged pool indexed by those indices,
 # rather than a contiguous [N, HV, K, V] buffer. Speculative decoding uses
 # num_accepted_tokens to pick the correct rolled-back state slot.
+#
+# Beta guard: with BETA_GUARD set, the erase-gate tile goes through the same
+# key-weighted contrast test and projection as chunk_gdn2.py before it is used,
+# on the normalized key b_k and activated decay b_gk of this very step. The
+# reductions over K rely on one program covering the full K axis
+# (BK = next_power_of_2(K), as set by the launcher).
 # =============================================================================
 @triton.heuristics(
     {
@@ -94,6 +109,7 @@ def fused_recurrent_gdn2_fwd_kernel(
     ssm_state_indices,
     num_accepted_tokens,
     lower_bound,
+    quant_eps,
     scale: tl.constexpr,
     N: tl.int64,
     T: tl.int64,
@@ -118,6 +134,8 @@ def fused_recurrent_gdn2_fwd_kernel(
     USE_GATE_IN_KERNEL: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
+    BETA_GUARD: tl.constexpr,
+    MARGIN: tl.constexpr,
     num_stages: tl.constexpr,
 ):
     # Decompose the flat program id into (K-block, V-block, sequence,
@@ -222,6 +240,62 @@ def fused_recurrent_gdn2_fwd_kernel(
             b_h *= exp(b_gk[:, None])
 
         b_b_tile = tl.load(p_b, mask=mask_k, other=0, eviction_policy='evict_last').to(tl.float32)
+
+        if BETA_GUARD:
+            # Exact rank-one erase geometry, matching chunk_gdn2.py:
+            # n = |k|^2, a = sum(b k^2), nu = sum(b^2 k^2), r2 = n*nu - a^2 >= 0.
+            b_k2 = b_k * b_k
+            n = tl.sum(b_k2, axis=0)
+            a = tl.sum(b_b_tile * b_k2, axis=0)
+            nu = tl.sum(b_b_tile * b_b_tile * b_k2, axis=0)
+            r2 = tl.maximum(n * nu - a * a, 0.0)
+
+            # ||Diag(exp(g))||_2 = exp(g_max). The full update is certified
+            # non-expansive when the beta-contrast budget below is respected.
+            g_max = tl.max(
+                tl.where(mask_k, b_gk, -float("inf")),
+                axis=0,
+            )
+            c2 = tl.exp(-2.0 * g_max)
+            r2_crit = (c2 - 1.0) * (
+                1.0 - ((1.0 - a) * (1.0 - a)) / c2
+            )
+            r2_crit = tl.maximum(r2_crit, 0.0)
+
+            has_key = n > 1.0e-20
+            unsafe = has_key & (r2 > r2_crit)
+
+            # Preserve the key-weighted mean erase strength and reduce only
+            # the unsafe channel contrast.
+            mu = a / tl.maximum(n, 1.0e-20)
+            eta = tl.sqrt((1.0 - MARGIN) * r2_crit / tl.maximum(r2, 1.0e-30))
+            eta = tl.minimum(tl.maximum(eta, 0.0), 1.0)
+            projected = mu + eta * (b_b_tile - mu)
+            candidate = tl.where(unsafe, projected, b_b_tile)
+
+            # Match the chunk path exactly: quantize to beta's storage dtype,
+            # verify the quantized candidate, and use a scalar fallback only
+            # if quantization crosses the analytical boundary.
+            candidate_q = candidate.to(b.dtype.element_ty).to(tl.float32)
+            a_q = tl.sum(candidate_q * b_k2, axis=0)
+            nu_q = tl.sum(candidate_q * candidate_q * b_k2, axis=0)
+            r2_q = tl.maximum(n * nu_q - a_q * a_q, 0.0)
+            r2_crit_q = (c2 - 1.0) * (
+                1.0 - ((1.0 - a_q) * (1.0 - a_q)) / c2
+            )
+            r2_crit_q = tl.maximum(r2_crit_q, 0.0)
+
+            # Exact projection lands ON the boundary; tolerate out-dtype
+            # rounding noise on the r2 = n*nu - a^2 cancellation.
+            quant_tol = quant_eps * (n * nu_q + a_q * a_q)
+            needs_scalar_fallback = unsafe & (r2_q > r2_crit_q + quant_tol)
+            mu_q = a_q / tl.maximum(n, 1.0e-20)
+            final_b = tl.where(needs_scalar_fallback, mu_q, candidate_q)
+
+            # The chunk path stores final_b to beta's dtype before recurrence.
+            # Re-quantize here so decode consumes the same effective values.
+            b_b_tile = final_b.to(b.dtype.element_ty).to(tl.float32)
+
         b_bk = b_b_tile * b_k
 
         # b_v_new = (w ⊙ v) - (b ⊙ k)^T @ S
@@ -302,6 +376,7 @@ def fused_recurrent_gdn2_fwd(
     lower_bound: float | None = None,
     out: torch.Tensor | None = None,
     transpose_state_layout: bool = False,
+    beta_guard: bool = True,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate buffers and launch the recurrent forward kernel.
@@ -326,6 +401,9 @@ def fused_recurrent_gdn2_fwd(
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK = triton.next_power_of_2(K)
     BV = 32
+    if beta_guard:
+        # Same head-dim range as `_GDN2BetaGuard.project` in chunk_gdn2.py.
+        assert 2 <= K <= 256, f"beta_guard supports 2 <= K <= 256; got K={K}."
 
     if out is None:
         out = torch.zeros_like(v)
@@ -371,6 +449,7 @@ def fused_recurrent_gdn2_fwd(
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
         lower_bound=lower_bound,
+        quant_eps=GUARD_QUANT_TOL_MULT * torch.finfo(b.dtype).eps,
         scale=scale,
         N=N,
         T=T,
@@ -388,6 +467,8 @@ def fused_recurrent_gdn2_fwd(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         TRANSPOSE_STATE=transpose_state_layout,
+        BETA_GUARD=beta_guard,
+        MARGIN=GUARD_MARGIN,
         num_warps=4,
         num_stages=2,
     )
@@ -413,6 +494,7 @@ def fused_recurrent_gdn2(
     lower_bound: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     transpose_state_layout: bool = False,
+    beta_guard: bool = True,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
@@ -438,6 +520,11 @@ def fused_recurrent_gdn2(
             use the bounded activation `lower_bound * sigmoid(exp(A_log) * g)`.
         cu_seqlens (Optional[torch.LongTensor]): `[N+1]` packed-sequence offsets.
         transpose_state_layout (bool): store state as `[V, K]` instead of `[K, V]`.
+        beta_guard (bool): fuse the conditional key-weighted beta-contrast
+            safeguard of `chunk_gdn2` into the token loop. Default: `True`.
+            Safe erase gates are used unchanged; only unsafe channel contrast
+            is reduced. Decay and write gate are never modified. Requires
+            `use_qk_l2norm_in_kernel=True`, as in the chunkwise path.
 
     Returns:
         o (torch.Tensor): outputs of shape `[B, T, HV, V]`.
@@ -467,6 +554,12 @@ def fused_recurrent_gdn2(
         f"w must have shape [B, T, HV, V] matching v; got {tuple(w.shape)} "
         f"vs v {tuple(v.shape)}."
     )
+    # Same contract as `chunk_gdn2`: the guard must see the normalized key.
+    if beta_guard and not use_qk_l2norm_in_kernel:
+        raise ValueError(
+            "`beta_guard=True` requires `use_qk_l2norm_in_kernel=True` so the "
+            "sensor sees the exact normalized key used by the recurrence."
+        )
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -488,6 +581,7 @@ def fused_recurrent_gdn2(
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
         transpose_state_layout=transpose_state_layout,
+        beta_guard=beta_guard,
     )
     return o, final_state
 
