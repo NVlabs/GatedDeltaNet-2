@@ -95,26 +95,6 @@ from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_g
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd_dAv
 from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
 
-
-# =============================================================================
-# BETA-CONTRAST GUARD
-# -----------------------------------------------------------------------------
-# _gdn2_beta_guard_fwd_kernel / _GDN2BetaGuard
-#
-# Conditional sensor/actuator on the erase gate b (``beta_guard``, on by
-# default). Per (token, head) row, from the L2-normalized key k, the gate b and
-# the per-token decay g recovered from the chunk-local cumsum, it tests whether
-# the erase step (I - k (b*k)^T) Diag(exp(g)) is certified non-expansive.
-# Safe rows pass through unchanged. Unsafe rows keep their key-weighted mean
-# erase strength and only have the channel contrast of b shrunk onto the
-# boundary (less GUARD_MARGIN); the candidate is re-tested after quantization
-# to b's dtype, with a scalar-mean fallback if rounding crosses the boundary.
-# Decay and write gate are never modified.
-#
-# The projected gate replaces b in every downstream kernel, forward and
-# backward. It runs outside autograd, so the gradient w.r.t. b is
-# straight-through.
-# =============================================================================
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
